@@ -3,6 +3,24 @@ import Accelerate
 import Foundation
 import OSLog
 
+/// Progress phase during diarization processing
+public enum DiarizationProgressPhase: Sendable {
+    /// Segmentation phase with progress fraction (0.0 to 1.0)
+    case segmentation(progress: Double)
+    /// Embedding extraction started
+    case embeddingStarted
+    /// Embedding extraction completed
+    case embeddingCompleted
+    /// Clustering completed
+    case clusteringCompleted
+    /// All processing completed
+    case completed
+}
+
+/// Progress callback for diarization processing
+/// - Parameter phase: Current processing phase with optional progress
+public typealias DiarizationProgressCallback = @Sendable (DiarizationProgressPhase) -> Void
+
 @available(macOS 14.0, iOS 17.0, *)
 public final class OfflineDiarizerManager {
     private let logger = AppLogger(category: "OfflineDiarizer")
@@ -97,9 +115,11 @@ public final class OfflineDiarizerManager {
 
     /// Process audio from a file URL using memory-mapped streaming for efficiency.
     /// Automatically converts the audio to the target sample rate and processes in chunks.
-    /// - Parameter url: Path to the audio file
+    /// - Parameters:
+    ///   - url: Path to the audio file
+    ///   - progress: Optional callback for progress updates (0.0 to 1.0)
     /// - Returns: Diarization result with speaker segments
-    public func process(_ url: URL) async throws -> DiarizationResult {
+    public func process(_ url: URL, progress: DiarizationProgressCallback? = nil) async throws -> DiarizationResult {
         let factory = StreamingAudioSourceFactory()
         let (source, loadDuration) = try factory.makeDiskBackedSource(
             from: url,
@@ -109,13 +129,15 @@ public final class OfflineDiarizerManager {
 
         return try await process(
             audioSource: source,
-            audioLoadingSeconds: loadDuration
+            audioLoadingSeconds: loadDuration,
+            progress: progress
         )
     }
 
     public func process(
         audioSource: StreamingAudioSampleSource,
-        audioLoadingSeconds: TimeInterval
+        audioLoadingSeconds: TimeInterval,
+        progress: DiarizationProgressCallback? = nil
     ) async throws -> DiarizationResult {
         try config.validate()
         if models == nil {
@@ -136,6 +158,13 @@ public final class OfflineDiarizerManager {
         let capturedModels = models
         let capturedConfig = config
 
+        // Calculate total chunks for progress reporting
+        // Segmentation processes in windows with step size overlap
+        let totalSamples = audioSource.sampleCount
+        let stepSize = capturedConfig.samplesPerStep
+        let estimatedTotalChunks = max(1, (totalSamples + stepSize - 1) / stepSize)
+        let progressCallback = progress
+
         let segmentationTask = Task(priority: .userInitiated) {
             [capturedModels, capturedConfig] () throws -> (SegmentationOutput, TimeInterval) in
             let processor = OfflineSegmentationProcessor()
@@ -146,6 +175,12 @@ public final class OfflineDiarizerManager {
                     segmentationModel: capturedModels.segmentationModel,
                     config: capturedConfig,
                     chunkHandler: { chunk in
+                        // Report segmentation progress (0.0 to 1.0)
+                        if let progressCallback {
+                            let segmentationProgress = min(1.0, Double(chunk.chunkIndex + 1) / Double(estimatedTotalChunks))
+                            progressCallback(.segmentation(progress: segmentationProgress))
+                        }
+
                         switch chunkContinuation.yield(chunk) {
                         case .enqueued, .dropped:
                             return .continue
@@ -199,6 +234,9 @@ public final class OfflineDiarizerManager {
 
         let (timedEmbeddings, embeddingTime) = embeddingResult
         logger.debug("Embedding extraction produced \(timedEmbeddings.count) vectors in \(embeddingTime)s (async)")
+
+        // Progress: Embedding complete
+        progress?(.embeddingCompleted)
 
         let pldaTransform = PLDATransform(pldaRhoModel: models.pldaRhoModel, psi: models.pldaPsi)
 
@@ -298,6 +336,9 @@ public final class OfflineDiarizerManager {
             logger.debug("Clustering completed in \(clusteringTime)s with no assignments")
         }
 
+        // Progress: Clustering complete
+        progress?(.clusteringCompleted)
+
         let reconstruction = OfflineReconstruction(config: config)
         let segments = reconstruction.buildSegments(
             segmentation: segmentation,
@@ -324,6 +365,9 @@ public final class OfflineDiarizerManager {
             speakerClusteringSeconds: clusteringTime,
             postProcessingSeconds: max(0, totalProcessing - segmentationTime - embeddingTime - clusteringTime)
         )
+
+        // Progress: Complete
+        progress?(.completed)
 
         return DiarizationResult(
             segments: segments,
