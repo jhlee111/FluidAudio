@@ -90,38 +90,37 @@ public struct OfflineDiarizerModels: Sendable {
         logger.info("Loading offline diarization models from \(modelsDirectory.path)")
 
         let loadStart = Date()
-        let inferenceComputeUnits: MLComputeUnits = .all
+        let config = configuration ?? defaultConfiguration()
 
-        let segmentationAndEmbeddingNames: [String] = [
-            ModelNames.OfflineDiarizer.segmentationPath,
-            ModelNames.OfflineDiarizer.embeddingPath,
-            ModelNames.OfflineDiarizer.pldaRhoPath,
-        ]
-
-        let segmentationEmbeddingModels = try await DownloadUtils.loadModels(
+        let models = try await DownloadUtils.loadModels(
             .diarizer,
-            modelNames: segmentationAndEmbeddingNames,
+            modelNames: [
+                ModelNames.OfflineDiarizer.segmentationPath,
+                ModelNames.OfflineDiarizer.embeddingPath,
+                ModelNames.OfflineDiarizer.pldaRhoPath,
+            ],
             directory: modelsDirectory,
-            computeUnits: inferenceComputeUnits,
+            computeUnits: config.computeUnits,
             variant: "offline"
         )
+        let segmentationModels = models
+        let embeddingModels = models
 
-        guard let segmentation = segmentationEmbeddingModels[ModelNames.OfflineDiarizer.segmentationPath] else {
+        guard let segmentation = segmentationModels[ModelNames.OfflineDiarizer.segmentationPath] else {
             throw OfflineDiarizationError.modelNotLoaded(ModelNames.OfflineDiarizer.segmentation)
         }
-        guard let embedding = segmentationEmbeddingModels[ModelNames.OfflineDiarizer.embeddingPath] else {
+        guard let embedding = embeddingModels[ModelNames.OfflineDiarizer.embeddingPath] else {
             throw OfflineDiarizationError.modelNotLoaded(ModelNames.OfflineDiarizer.embedding)
         }
-        guard let plda = segmentationEmbeddingModels[ModelNames.OfflineDiarizer.pldaRhoPath] else {
+        guard let plda = segmentationModels[ModelNames.OfflineDiarizer.pldaRhoPath] else {
             throw OfflineDiarizationError.modelNotLoaded(ModelNames.OfflineDiarizer.pldaRho)
         }
 
-        let fbankComputeUnits: MLComputeUnits = .cpuOnly
         let fbankModels = try await DownloadUtils.loadModels(
             .diarizer,
             modelNames: [ModelNames.OfflineDiarizer.fbankPath],
             directory: modelsDirectory,
-            computeUnits: fbankComputeUnits,
+            computeUnits: config.computeUnits,
             variant: "offline"
         )
         guard let fbank = fbankModels[ModelNames.OfflineDiarizer.fbankPath] else {
@@ -132,7 +131,7 @@ public struct OfflineDiarizerModels: Sendable {
         let compilationDuration = Date().timeIntervalSince(loadStart)
         let compileString = String(format: "%.3f", compilationDuration)
         logger.info(
-            "Offline diarization models ready (compile: \(compileString)s, computeUnits: segmentation/embedding/plda=\(inferenceComputeUnits.label), fbank=\(fbankComputeUnits.label))"
+            "Offline diarization models ready (compile: \(compileString)s, computeUnits: \(config.computeUnits.label))"
         )
 
         return OfflineDiarizerModels(
