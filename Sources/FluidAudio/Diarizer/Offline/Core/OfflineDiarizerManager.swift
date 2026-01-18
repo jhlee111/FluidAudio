@@ -343,7 +343,8 @@ public final class OfflineDiarizerManager {
         let segments = reconstruction.buildSegments(
             segmentation: segmentation,
             hardClusters: chunkAssignments,
-            centroids: centroids
+            centroids: centroids,
+            timedEmbeddings: timedEmbeddings
         )
 
         let speakerDatabase = reconstruction.buildSpeakerDatabase(segments: segments)

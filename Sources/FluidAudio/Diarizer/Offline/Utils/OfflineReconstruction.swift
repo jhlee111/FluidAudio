@@ -19,7 +19,8 @@ struct OfflineReconstruction {
     func buildSegments(
         segmentation: SegmentationOutput,
         hardClusters: [[Int]],
-        centroids: [[Double]]
+        centroids: [[Double]],
+        timedEmbeddings: [TimedEmbedding] = []
     ) -> [TimedSpeakerSegment] {
         guard segmentation.numChunks > 0, segmentation.numFrames > 0 else { return [] }
 
@@ -162,9 +163,31 @@ struct OfflineReconstruction {
         for frame in 0..<totalFrames {
             let required = speakerCountPerFrame[frame]
             guard required > 0 else { continue }
-            let ranked = activationSums[frame].enumerated().sorted { $0.element > $1.element }
-            let selected = ranked.prefix(required).map { $0.offset }
+
+            // Filter to clusters with activation > 0, then rank by activation strength
+            let ranked = activationSums[frame].enumerated()
+                .filter { $0.element > 0 }
+                .sorted { $0.element > $1.element }
+
+            // Select all active clusters (up to clusterCount) instead of just top-K
+            // This respects VBx clustering results even when speakers don't overlap
+            let selected = ranked.prefix(clusterCount).map { $0.offset }
             perFrameClusters[frame] = selected
+        }
+
+        // Debug: Log cluster frame counts for verification
+        var clusterFrameCounts = [Int: Int]()
+        for frameClusters in perFrameClusters {
+            for cluster in frameClusters {
+                clusterFrameCounts[cluster, default: 0] += 1
+            }
+        }
+        if !clusterFrameCounts.isEmpty {
+            let countsString = clusterFrameCounts
+                .sorted { $0.key < $1.key }
+                .map { "S\($0.key + 1):\($0.value)" }
+                .joined(separator: ", ")
+            logger.debug("Cluster frame counts: \(countsString)")
         }
 
         var activeSegments: [Int: Accumulator] = [:]
@@ -182,6 +205,7 @@ struct OfflineReconstruction {
                     accumulator: accumulator,
                     endTime: frameStart,
                     centroids: centroids,
+                    timedEmbeddings: timedEmbeddings,
                     output: &rawSegments
                 )
             }
@@ -211,11 +235,33 @@ struct OfflineReconstruction {
                 accumulator: accumulator,
                 endTime: accumulator.end,
                 centroids: centroids,
+                timedEmbeddings: timedEmbeddings,
                 output: &rawSegments
             )
         }
 
+        // Debug: Log raw segments per speaker before merge
+        let rawSpeakerCounts = Dictionary(grouping: rawSegments, by: \.speakerId)
+            .mapValues { $0.count }
+        if !rawSpeakerCounts.isEmpty {
+            let countsString = rawSpeakerCounts.sorted { $0.key < $1.key }
+                .map { "\($0.key):\($0.value)" }
+                .joined(separator: ", ")
+            logger.debug("Raw segments per speaker: \(countsString)")
+        }
+
         let merged = mergeSegments(rawSegments, gapThreshold: gapThreshold)
+
+        // Debug: Log merged segments per speaker
+        let mergedSpeakerCounts = Dictionary(grouping: merged, by: \.speakerId)
+            .mapValues { $0.count }
+        if !mergedSpeakerCounts.isEmpty {
+            let countsString = mergedSpeakerCounts.sorted { $0.key < $1.key }
+                .map { "\($0.key):\($0.value)" }
+                .joined(separator: ", ")
+            logger.debug("Merged segments per speaker: \(countsString)")
+        }
+
         return sanitize(segments: merged)
     }
 
@@ -278,7 +324,7 @@ struct OfflineReconstruction {
         return database
     }
 
-    private func excludeOverlaps(in segments: [TimedSpeakerSegment]) -> [TimedSpeakerSegment] {
+    private func excludeOverlaps(in segments: [TimedSpeakerSegment], protectedSpeakers: Set<String> = []) -> [TimedSpeakerSegment] {
         guard !segments.isEmpty else { return [] }
 
         var sanitized: [TimedSpeakerSegment] = []
@@ -293,12 +339,24 @@ struct OfflineReconstruction {
                 }
             }
 
+            let isProtected = protectedSpeakers.contains(segment.speakerId)
+
+            // For protected speakers, keep original timing even if fully overlapped
+            // This preserves sparse speakers that overlap with dominant speakers
             if adjustedStart >= adjustedEnd {
-                continue
+                if isProtected {
+                    // Keep the original segment without adjustment for protected speakers
+                    logger.debug("Protected segment kept despite overlap: \(segment.speakerId) [\(String(format: "%.2f", segment.startTimeSeconds))-\(String(format: "%.2f", segment.endTimeSeconds))]s")
+                    adjustedStart = segment.startTimeSeconds
+                } else {
+                    logger.debug("Segment removed (fully overlapped): \(segment.speakerId) [\(String(format: "%.2f", segment.startTimeSeconds))-\(String(format: "%.2f", segment.endTimeSeconds))]s, adjustedStart=\(String(format: "%.2f", adjustedStart))")
+                    continue
+                }
             }
 
             let duration = adjustedEnd - adjustedStart
-            if duration < Float(config.minSegmentDuration) {
+            // Skip minSegmentDuration check for protected (rescued) speakers
+            if !isProtected && duration < Float(config.minSegmentDuration) {
                 continue
             }
 
@@ -324,6 +382,7 @@ struct OfflineReconstruction {
         accumulator: Accumulator,
         endTime: Double,
         centroids: [[Double]],
+        timedEmbeddings: [TimedEmbedding],
         output: inout [TimedSpeakerSegment]
     ) {
         guard endTime > accumulator.start else { return }
@@ -334,15 +393,27 @@ struct OfflineReconstruction {
             averageScore = accumulator.scoreSum
         }
         let quality = Float(min(max(averageScore, 0), 1))
-        let centroidDouble =
-            centroids.indices.contains(cluster)
-            ? centroids[cluster]
-            : Array(repeating: 0, count: centroids.first?.count ?? 0)
-        let centroid = centroidDouble.map { Float($0) }
+
+        // Try to find a matching embedding for this segment's time range
+        let segmentEmbedding: [Float]
+        if let matchingEmbedding = findBestMatchingEmbedding(
+            startTime: accumulator.start,
+            endTime: endTime,
+            timedEmbeddings: timedEmbeddings
+        ) {
+            segmentEmbedding = matchingEmbedding
+        } else {
+            // Fallback to centroid if no matching embedding found
+            let centroidDouble =
+                centroids.indices.contains(cluster)
+                ? centroids[cluster]
+                : Array(repeating: 0, count: centroids.first?.count ?? 0)
+            segmentEmbedding = centroidDouble.map { Float($0) }
+        }
 
         let segment = TimedSpeakerSegment(
             speakerId: "S\(cluster + 1)",
-            embedding: centroid,
+            embedding: segmentEmbedding,
             startTimeSeconds: Float(accumulator.start),
             endTimeSeconds: Float(endTime),
             qualityScore: quality
@@ -406,15 +477,78 @@ struct OfflineReconstruction {
             Float(config.minSegmentDuration),
             Float(config.segmentationMinDurationOn)
         )
-        ordered = ordered.filter {
+
+        // Count unique speakers before filtering
+        let speakersBeforeFiltering = Set(ordered.map { $0.speakerId })
+
+        // Debug: Log segment durations per speaker before filtering
+        for speaker in speakersBeforeFiltering.sorted() {
+            let speakerSegments = ordered.filter { $0.speakerId == speaker }
+            let durations = speakerSegments.map { $0.endTimeSeconds - $0.startTimeSeconds }
+            let durationsStr = durations.map { String(format: "%.2f", $0) }.joined(separator: ", ")
+            logger.debug("Before filter - \(speaker): \(speakerSegments.count) segments, durations=[\(durationsStr)]s, minDuration=\(String(format: "%.2f", minimumDuration))s")
+        }
+
+        // Apply standard filtering
+        var filtered = ordered.filter {
             ($0.endTimeSeconds - $0.startTimeSeconds) >= minimumDuration
         }
 
-        if config.embeddingExcludeOverlap {
-            ordered = excludeOverlaps(in: ordered)
+        // Check if filtering removed any speakers entirely
+        let speakersAfterFiltering = Set(filtered.map { $0.speakerId })
+        let lostSpeakers = speakersBeforeFiltering.subtracting(speakersAfterFiltering)
+
+        // Debug: Log lost speakers
+        if !lostSpeakers.isEmpty {
+            logger.debug("Lost speakers after filtering: \(lostSpeakers.sorted())")
         }
 
-        return ordered
+        // If speakers were lost, rescue their segments with a much lower threshold
+        if !lostSpeakers.isEmpty {
+            // Use a very aggressive rescue threshold of 0.05s to preserve sparse speakers
+            let rescueThreshold: Float = 0.05
+            let rescuedSegments = ordered.filter { segment in
+                lostSpeakers.contains(segment.speakerId) &&
+                (segment.endTimeSeconds - segment.startTimeSeconds) >= rescueThreshold
+            }
+
+            if !rescuedSegments.isEmpty {
+                logger.debug("Rescued \(rescuedSegments.count) segments for lost speakers: \(lostSpeakers)")
+                filtered.append(contentsOf: rescuedSegments)
+                filtered.sort { $0.startTimeSeconds < $1.startTimeSeconds }
+            } else {
+                // Even more aggressive: keep ALL segments for lost speakers regardless of duration
+                let allLostSegments = ordered.filter { lostSpeakers.contains($0.speakerId) }
+                if !allLostSegments.isEmpty {
+                    logger.debug("Force-rescued \(allLostSegments.count) segments for lost speakers: \(lostSpeakers)")
+                    filtered.append(contentsOf: allLostSegments)
+                    filtered.sort { $0.startTimeSeconds < $1.startTimeSeconds }
+                }
+            }
+        }
+
+        if config.embeddingExcludeOverlap {
+            // First pass: excludeOverlaps with currently known lost speakers protected
+            filtered = excludeOverlaps(in: filtered, protectedSpeakers: lostSpeakers)
+
+            // Check if excludeOverlaps removed any additional speakers
+            let speakersAfterOverlaps = Set(filtered.map { $0.speakerId })
+            let newlyLostSpeakers = speakersBeforeFiltering.subtracting(speakersAfterOverlaps)
+
+            // If new speakers were lost due to overlap exclusion, rescue them
+            if newlyLostSpeakers.count > lostSpeakers.count {
+                let additionalLost = newlyLostSpeakers.subtracting(lostSpeakers)
+                logger.debug("Speakers lost during overlap exclusion: \(additionalLost.sorted())")
+
+                // Re-run excludeOverlaps with all lost speakers protected
+                filtered = excludeOverlaps(in: ordered.filter {
+                    ($0.endTimeSeconds - $0.startTimeSeconds) >= minimumDuration ||
+                    newlyLostSpeakers.contains($0.speakerId)
+                }, protectedSpeakers: newlyLostSpeakers)
+            }
+        }
+
+        return filtered
     }
 
     private func chunkStartTime(
@@ -426,5 +560,31 @@ struct OfflineReconstruction {
         } else {
             return Double(chunkIndex) * config.windowDuration
         }
+    }
+
+    /// Find the best matching embedding for a segment by time overlap.
+    /// Returns the embedding with the highest temporal overlap with the segment.
+    private func findBestMatchingEmbedding(
+        startTime: Double,
+        endTime: Double,
+        timedEmbeddings: [TimedEmbedding]
+    ) -> [Float]? {
+        guard !timedEmbeddings.isEmpty else { return nil }
+
+        var bestEmbedding: [Float]?
+        var bestOverlap: Double = 0
+
+        for embedding in timedEmbeddings {
+            let overlapStart = max(startTime, embedding.startTime)
+            let overlapEnd = min(endTime, embedding.endTime)
+            let overlap = overlapEnd - overlapStart
+
+            if overlap > bestOverlap {
+                bestOverlap = overlap
+                bestEmbedding = embedding.embedding256
+            }
+        }
+
+        return bestEmbedding
     }
 }
