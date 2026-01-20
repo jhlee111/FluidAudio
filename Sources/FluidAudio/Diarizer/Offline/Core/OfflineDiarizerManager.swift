@@ -773,6 +773,52 @@ public final class OfflineDiarizerManager {
         return matrix
     }
 
+    // MARK: - Single Segment Embedding Extraction
+
+    /// Extract a 256-dim WeSpeaker embedding for a single audio segment.
+    /// This is useful for re-extracting embeddings after segment splits without running full diarization.
+    ///
+    /// - Parameters:
+    ///   - audioURL: URL to the audio file
+    ///   - startTime: Start time in seconds
+    ///   - endTime: End time in seconds
+    /// - Returns: 256-dimensional WeSpeaker embedding
+    public func extractSingleEmbedding(
+        from audioURL: URL,
+        startTime: TimeInterval,
+        endTime: TimeInterval
+    ) async throws -> [Float] {
+        if models == nil {
+            try await prepareModels()
+        }
+
+        guard let models else {
+            throw OfflineDiarizationError.modelNotLoaded("offline-diarizer")
+        }
+
+        // Create audio source from URL
+        let factory = StreamingAudioSourceFactory()
+        let (source, _) = try factory.makeDiskBackedSource(
+            from: audioURL,
+            targetSampleRate: config.segmentation.sampleRate
+        )
+        defer { source.cleanup() }
+
+        // Create extractor and extract embedding
+        let extractor = OfflineEmbeddingExtractor(
+            fbankModel: models.fbankModel,
+            embeddingModel: models.embeddingModel,
+            pldaTransform: PLDATransform(pldaRhoModel: models.pldaRhoModel, psi: models.pldaPsi),
+            config: config
+        )
+
+        return try extractor.extractSingleEmbedding(
+            audioSource: source,
+            startTime: startTime,
+            endTime: endTime
+        )
+    }
+
     private func exportEmbeddings(
         embeddings: [TimedEmbedding],
         assignments: [Int],

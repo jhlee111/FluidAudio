@@ -883,4 +883,78 @@ struct OfflineEmbeddingExtractor {
         }
         return 0
     }
+
+    // MARK: - Single Segment Embedding Extraction
+
+    /// Extract a 256-dim WeSpeaker embedding for a single audio segment.
+    /// This is useful for re-extracting embeddings after segment splits without running full diarization.
+    ///
+    /// - Parameters:
+    ///   - audioSource: Audio sample source
+    ///   - startTime: Start time in seconds
+    ///   - endTime: End time in seconds
+    /// - Returns: 256-dimensional WeSpeaker embedding
+    func extractSingleEmbedding(
+        audioSource: StreamingAudioSampleSource,
+        startTime: TimeInterval,
+        endTime: TimeInterval
+    ) throws -> [Float] {
+        let duration = endTime - startTime
+        guard duration >= 0.1 else {
+            logger.warning("Segment too short for embedding extraction: \(duration)s")
+            return [Float](repeating: 0, count: 256)
+        }
+
+        // Calculate sample range
+        let sampleRate = config.sampleRate
+        let startSample = Int(startTime * Double(sampleRate))
+        let endSample = Int(endTime * Double(sampleRate))
+        let totalSamples = audioSource.sampleCount
+
+        let clampedStart = max(0, min(startSample, totalSamples))
+        let clampedEnd = max(clampedStart, min(endSample, totalSamples))
+        let sampleCount = clampedEnd - clampedStart
+
+        guard sampleCount > 0 else {
+            logger.warning("No samples available for embedding extraction")
+            return [Float](repeating: 0, count: 256)
+        }
+
+        // Load audio samples
+        var audioBuffer = [Float](repeating: 0, count: audioSampleCount)
+        try audioBuffer.withUnsafeMutableBufferPointer { pointer in
+            guard let baseAddress = pointer.baseAddress else { return }
+            try audioSource.copySamples(
+                into: baseAddress,
+                offset: clampedStart,
+                count: min(sampleCount, audioSampleCount)
+            )
+        }
+
+        // Run FBank model to get mel-spectrogram
+        let fbankInput = try audioBuffer.withUnsafeBufferPointer { pointer -> MLMultiArray in
+            guard let baseAddress = pointer.baseAddress else {
+                throw OfflineDiarizationError.processingFailed("Failed to access audio buffer")
+            }
+            return try prepareFbankInput(
+                chunkPointer: baseAddress,
+                length: min(sampleCount, audioSampleCount)
+            )
+        }
+
+        let fbankFeatures = try runFbankModel(audioArray: fbankInput)
+
+        // Create full-activation mask (all 1s for entire segment)
+        let fullMask = [Float](repeating: 1.0, count: weightFrameCount)
+        let weightsArray = try prepareWeightsInput(weights: fullMask)
+
+        // Run embedding model
+        let embedding = try runEmbeddingModel(
+            fbankFeatures: fbankFeatures,
+            weightsArray: weightsArray
+        )
+
+        logger.debug("Extracted single embedding for segment \(String(format: "%.2f", startTime))-\(String(format: "%.2f", endTime))s (\(embedding.count) dims)")
+        return embedding
+    }
 }
