@@ -340,14 +340,14 @@ public final class OfflineDiarizerManager {
         progress?(.clusteringCompleted)
 
         let reconstruction = OfflineReconstruction(config: config)
-        let segments = reconstruction.buildSegments(
+        let buildResult = reconstruction.buildSegmentsWithAnalysis(
             segmentation: segmentation,
             hardClusters: chunkAssignments,
             centroids: centroids,
             timedEmbeddings: timedEmbeddings
         )
 
-        let speakerDatabase = reconstruction.buildSpeakerDatabase(segments: segments)
+        let speakerDatabase = reconstruction.buildSpeakerDatabase(segments: buildResult.segments)
 
         if let exportPath = config.embeddingExportPath {
             try exportEmbeddings(
@@ -371,9 +371,10 @@ public final class OfflineDiarizerManager {
         progress?(.completed)
 
         return DiarizationResult(
-            segments: segments,
+            segments: buildResult.segments,
             speakerDatabase: speakerDatabase,
-            timings: timings
+            timings: timings,
+            frameLevelAnalysis: buildResult.frameLevelAnalysis
         )
     }
 
@@ -817,6 +818,15 @@ public final class OfflineDiarizerManager {
             startTime: startTime,
             endTime: endTime
         )
+    }
+
+    /// Alias for extractSingleEmbedding - uses in-memory processing (no temp files)
+    public func extractSingleEmbeddingInMemory(
+        from audioURL: URL,
+        startTime: TimeInterval,
+        endTime: TimeInterval
+    ) async throws -> [Float] {
+        try await extractSingleEmbedding(from: audioURL, startTime: startTime, endTime: endTime)
     }
 
     private func exportEmbeddings(

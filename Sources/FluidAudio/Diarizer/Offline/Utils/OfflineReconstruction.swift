@@ -10,10 +10,131 @@ struct OfflineReconstruction {
         var end: Double
         var scoreSum: Double
         var frameCount: Int
+        // Overlap tracking
+        var overlapFrameCount: Int = 0
+        var overlappingClusters: Set<Int> = []
+    }
+
+    /// Shared context for overlap calculation during segment building
+    private struct OverlapContext {
+        let speakerCountPerFrame: [Int]
+        let perFrameClusters: [[Int]]
+        let frameDuration: Double
     }
 
     init(config: OfflineDiarizerConfig) {
         self.config = config
+    }
+
+    /// Build frame-level analysis from segmentation output
+    func buildFrameLevelAnalysis(
+        segmentation: SegmentationOutput,
+        speakerCountPerFrame: [Int],
+        totalDuration: Double
+    ) -> FrameLevelAnalysis {
+        let frameDuration = segmentation.frameDuration
+        let totalFrames = speakerCountPerFrame.count
+        let numSpeakers = segmentation.numSpeakers
+        let numPowersetClasses = 8  // silence, S1, S2, S3, S1+S2, S1+S3, S2+S3, S1+S2+S3
+
+        // Calculate voice activity confidence per frame
+        // Sum of all speaker weights indicates overall voice activity
+        var voiceActivityConfidence = [Float](repeating: 0, count: totalFrames)
+
+        // Build flattened speaker weights: [globalFrame][speaker] -> probability
+        var flattenedWeights = [[Float]](
+            repeating: [Float](repeating: 0, count: numSpeakers),
+            count: totalFrames
+        )
+
+        // Build flattened powerset probs: [globalFrame][class] -> probability
+        // 8 classes: silence, S1, S2, S3, S1+S2, S1+S3, S2+S3, S1+S2+S3
+        var flattenedPowerset = [[Float]](
+            repeating: [Float](repeating: 0, count: numPowersetClasses),
+            count: totalFrames
+        )
+
+        for chunkIndex in 0..<segmentation.numChunks {
+            guard chunkIndex < segmentation.speakerWeights.count else { continue }
+            let chunkWeights = segmentation.speakerWeights[chunkIndex]
+            let chunkLogProbs = chunkIndex < segmentation.logProbs.count ? segmentation.logProbs[chunkIndex] : []
+            let chunkOffset = chunkStartTime(for: chunkIndex, segmentation: segmentation)
+
+            for frameIndex in 0..<chunkWeights.count {
+                let frameStart = chunkOffset + Double(frameIndex) * frameDuration
+                var globalFrame = Int((frameStart / frameDuration).rounded())
+                if globalFrame < 0 { globalFrame = 0 }
+                if globalFrame >= totalFrames { globalFrame = totalFrames - 1 }
+
+                // Voice activity = sum of speaker weights (capped at 1.0)
+                let weights = chunkWeights[frameIndex]
+                let totalActivity = weights.reduce(0, +)
+                voiceActivityConfidence[globalFrame] = max(
+                    voiceActivityConfidence[globalFrame],
+                    min(1.0, totalActivity)
+                )
+
+                // Store raw speaker weights (take max if overlapping chunks)
+                for (speakerIndex, weight) in weights.enumerated() where speakerIndex < numSpeakers {
+                    flattenedWeights[globalFrame][speakerIndex] = max(
+                        flattenedWeights[globalFrame][speakerIndex],
+                        weight
+                    )
+                }
+
+                // Store raw powerset class probabilities (convert from log-probs to probs)
+                if frameIndex < chunkLogProbs.count {
+                    let logProbs = chunkLogProbs[frameIndex]
+                    for (classIndex, logProb) in logProbs.enumerated() where classIndex < numPowersetClasses {
+                        // Convert log-probability to probability
+                        let prob = exp(logProb)
+                        flattenedPowerset[globalFrame][classIndex] = max(
+                            flattenedPowerset[globalFrame][classIndex],
+                            prob
+                        )
+                    }
+                }
+            }
+        }
+
+        return FrameLevelAnalysis(
+            speakerCount: speakerCountPerFrame,
+            voiceActivityConfidence: voiceActivityConfidence,
+            speakerWeights: flattenedWeights,
+            powersetProbs: flattenedPowerset,
+            frameDuration: frameDuration,
+            totalDuration: totalDuration,
+            numSpeakers: numSpeakers
+        )
+    }
+
+    /// Result containing both segments and frame-level analysis
+    struct BuildResult {
+        let segments: [TimedSpeakerSegment]
+        let frameLevelAnalysis: FrameLevelAnalysis
+    }
+
+    /// Build segments with frame-level analysis for advanced pipelines
+    func buildSegmentsWithAnalysis(
+        segmentation: SegmentationOutput,
+        hardClusters: [[Int]],
+        centroids: [[Double]],
+        timedEmbeddings: [TimedEmbedding] = []
+    ) -> BuildResult {
+        let (segments, speakerCountPerFrame, maxTime, frameDuration) = buildSegmentsInternal(
+            segmentation: segmentation,
+            hardClusters: hardClusters,
+            centroids: centroids,
+            timedEmbeddings: timedEmbeddings
+        )
+
+        let frameLevelAnalysis = buildFrameLevelAnalysis(
+            segmentation: segmentation,
+            speakerCountPerFrame: speakerCountPerFrame,
+            totalDuration: maxTime
+        )
+
+        return BuildResult(segments: segments, frameLevelAnalysis: frameLevelAnalysis)
     }
 
     func buildSegments(
@@ -22,10 +143,28 @@ struct OfflineReconstruction {
         centroids: [[Double]],
         timedEmbeddings: [TimedEmbedding] = []
     ) -> [TimedSpeakerSegment] {
-        guard segmentation.numChunks > 0, segmentation.numFrames > 0 else { return [] }
+        buildSegmentsInternal(
+            segmentation: segmentation,
+            hardClusters: hardClusters,
+            centroids: centroids,
+            timedEmbeddings: timedEmbeddings
+        ).segments
+    }
+
+    private func buildSegmentsInternal(
+        segmentation: SegmentationOutput,
+        hardClusters: [[Int]],
+        centroids: [[Double]],
+        timedEmbeddings: [TimedEmbedding] = []
+    ) -> (segments: [TimedSpeakerSegment], speakerCountPerFrame: [Int], maxTime: Double, frameDuration: Double) {
+        guard segmentation.numChunks > 0, segmentation.numFrames > 0 else {
+            return ([], [], 0, 0)
+        }
 
         let frameDuration = segmentation.frameDuration
-        guard frameDuration > 0 else { return [] }
+        guard frameDuration > 0 else {
+            return ([], [], 0, 0)
+        }
 
         let clusterCount = max(centroids.count, 1)
         let gapThreshold = max(config.minGapDuration, config.segmentationMinDurationOff)
@@ -198,6 +337,7 @@ struct OfflineReconstruction {
             let frameEnd = frameStart + frameDuration
             let activeClusters = Set(perFrameClusters[frameIndex])
             let averageScores = activationAverages[frameIndex]
+            let isOverlapFrame = speakerCountPerFrame[frameIndex] > 1
 
             for (cluster, accumulator) in activeSegments where !activeClusters.contains(cluster) {
                 appendSegment(
@@ -217,14 +357,30 @@ struct OfflineReconstruction {
                     existing.end = frameEnd
                     existing.scoreSum += score
                     existing.frameCount += 1
+                    // Track overlap info
+                    if isOverlapFrame {
+                        existing.overlapFrameCount += 1
+                        // Track which other clusters overlap with this one
+                        for otherCluster in activeClusters where otherCluster != cluster {
+                            existing.overlappingClusters.insert(otherCluster)
+                        }
+                    }
                     activeSegments[cluster] = existing
                 } else {
-                    activeSegments[cluster] = Accumulator(
+                    var newAccumulator = Accumulator(
                         start: frameStart,
                         end: frameEnd,
                         scoreSum: score,
                         frameCount: 1
                     )
+                    // Track overlap for new segments
+                    if isOverlapFrame {
+                        newAccumulator.overlapFrameCount = 1
+                        for otherCluster in activeClusters where otherCluster != cluster {
+                            newAccumulator.overlappingClusters.insert(otherCluster)
+                        }
+                    }
+                    activeSegments[cluster] = newAccumulator
                 }
             }
         }
@@ -262,7 +418,8 @@ struct OfflineReconstruction {
             logger.debug("Merged segments per speaker: \(countsString)")
         }
 
-        return sanitize(segments: merged)
+        let segments = sanitize(segments: merged)
+        return (segments, speakerCountPerFrame, maxTime, frameDuration)
     }
 
     func buildSpeakerDatabase(
@@ -369,7 +526,9 @@ struct OfflineReconstruction {
                 embedding: segment.embedding,
                 startTimeSeconds: adjustedStart,
                 endTimeSeconds: adjustedEnd,
-                qualityScore: adjustedQuality
+                qualityScore: adjustedQuality,
+                overlapRatio: segment.overlapRatio,
+                overlappingSpeakers: segment.overlappingSpeakers
             )
             sanitized.append(trimmed)
         }
@@ -394,6 +553,17 @@ struct OfflineReconstruction {
         }
         let quality = Float(min(max(averageScore, 0), 1))
 
+        // Calculate overlap ratio
+        let overlapRatio: Float
+        if accumulator.frameCount > 0 {
+            overlapRatio = Float(accumulator.overlapFrameCount) / Float(accumulator.frameCount)
+        } else {
+            overlapRatio = 0
+        }
+
+        // Convert overlapping cluster indices to speaker IDs
+        let overlappingSpeakers = accumulator.overlappingClusters.map { "S\($0 + 1)" }
+
         // Try to find a matching embedding for this segment's time range
         let segmentEmbedding: [Float]
         if let matchingEmbedding = findBestMatchingEmbedding(
@@ -416,7 +586,9 @@ struct OfflineReconstruction {
             embedding: segmentEmbedding,
             startTimeSeconds: Float(accumulator.start),
             endTimeSeconds: Float(endTime),
-            qualityScore: quality
+            qualityScore: quality,
+            overlapRatio: overlapRatio,
+            overlappingSpeakers: overlappingSpeakers
         )
         output.append(segment)
     }
@@ -435,13 +607,17 @@ struct OfflineReconstruction {
             if segment.speakerId == current.speakerId {
                 let gap = Double(segment.startTimeSeconds) - Double(current.endTimeSeconds)
                 if gap <= gapThreshold {
-                    let blended = blendedQuality(current, segment)
+                    let (blendedQual, blendedOverlap) = blendedMetrics(current, segment)
+                    // Combine overlapping speakers from both segments
+                    let combinedOverlapping = Array(Set(current.overlappingSpeakers + segment.overlappingSpeakers))
                     current = TimedSpeakerSegment(
                         speakerId: current.speakerId,
                         embedding: current.embedding,
                         startTimeSeconds: current.startTimeSeconds,
                         endTimeSeconds: max(current.endTimeSeconds, segment.endTimeSeconds),
-                        qualityScore: blended
+                        qualityScore: blendedQual,
+                        overlapRatio: blendedOverlap,
+                        overlappingSpeakers: combinedOverlapping
                     )
                     continue
                 }
@@ -455,20 +631,37 @@ struct OfflineReconstruction {
         return merged
     }
 
-    private func blendedQuality(_ lhs: TimedSpeakerSegment, _ rhs: TimedSpeakerSegment) -> Float {
+    /// Compute duration-weighted blended quality and overlap ratio for merged segments
+    private func blendedMetrics(
+        _ lhs: TimedSpeakerSegment,
+        _ rhs: TimedSpeakerSegment
+    ) -> (quality: Float, overlapRatio: Float) {
         let lhsDuration = Double(lhs.durationSeconds)
         let rhsDuration = Double(rhs.durationSeconds)
         let totalDuration = lhsDuration + rhsDuration
 
         guard totalDuration > 0 else {
-            return min(max((lhs.qualityScore + rhs.qualityScore) / 2, 0), 1)
+            let avgQuality = min(max((lhs.qualityScore + rhs.qualityScore) / 2, 0), 1)
+            let avgOverlap = (lhs.overlapRatio + rhs.overlapRatio) / 2
+            return (avgQuality, avgOverlap)
         }
 
-        let weighted =
+        let weightedQuality =
             Double(lhs.qualityScore) * lhsDuration
             + Double(rhs.qualityScore) * rhsDuration
 
-        return Float(min(max(weighted / totalDuration, 0), 1))
+        let weightedOverlap =
+            Double(lhs.overlapRatio) * lhsDuration
+            + Double(rhs.overlapRatio) * rhsDuration
+
+        return (
+            Float(min(max(weightedQuality / totalDuration, 0), 1)),
+            Float(weightedOverlap / totalDuration)
+        )
+    }
+
+    private func blendedQuality(_ lhs: TimedSpeakerSegment, _ rhs: TimedSpeakerSegment) -> Float {
+        blendedMetrics(lhs, rhs).quality
     }
 
     private func sanitize(segments: [TimedSpeakerSegment]) -> [TimedSpeakerSegment] {
